@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local model and run artefacts
+models/
+*.model
+*.txt.lock
+
+# Competition data is too large for normal GitHub storage.
+student_resource/dataset/
+
+# Generated predictions and archives; keep final files only if the team explicitly agrees.
+student_resource/output/
+student_resource/submission.zip
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+6ab5628d5a817_amazon_ml_challenge_problem_statement.pdf
