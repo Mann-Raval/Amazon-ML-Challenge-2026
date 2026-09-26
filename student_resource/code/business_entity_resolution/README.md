@@ -25,3 +25,19 @@ python -m src.evaluate --predictions predictions.tsv --ground-truth ../../datase
 ```
 
 Countries are treated as open string labels. No country list is hard-coded, so the test-only France partition is processed by the same code path as training countries.
+
+## Low-memory deterministic baseline
+
+If the full LightGBM pipeline exceeds available RAM, run the SQLite-backed baseline. It indexes Source 2/3 on disk and processes Source 1 one row at a time:
+
+```bash
+python -m src.rule_based \
+  --source1 ../../dataset/test/test_source1.tsv \
+  --source2 ../../dataset/test/test_source2.tsv \
+  --source3 ../../dataset/test/test_source3.tsv \
+  --matching-out ../../output/matching_results.tsv \
+  --candidate-out ../../output/candidate_pairs.tsv \
+  --db models/entity_index.sqlite
+```
+
+This conservative baseline uses exact normalized names plus matching addresses or postal codes. It is useful for a first valid score and uses much less RAM, while the LightGBM pipeline can recover additional typo and abbreviation matches when sufficient memory is available.
