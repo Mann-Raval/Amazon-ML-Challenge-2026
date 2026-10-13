@@ -35,6 +35,8 @@ def run(source1, source2, source3, matching_out, candidate_out, db_path=None):
     if temporary:
         handle, db_path = tempfile.mkstemp(prefix="entity_resolution_", suffix=".sqlite")
         os.close(handle)
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)) or ".", exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("PRAGMA journal_mode=OFF")
@@ -51,13 +53,13 @@ def run(source1, source2, source3, matching_out, candidate_out, db_path=None):
         os.makedirs(os.path.dirname(matching_out) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(candidate_out) or ".", exist_ok=True)
         with open(source1, encoding="utf-8", newline="") as f1, \
-             open(matching_out, "w", encoding="utf-8", newline="") as fm, \
-             open(candidate_out, "w", encoding="utf-8", newline="") as fc:
+             open(matching_out, "w", encoding="utf-8", newline="", buffering=1) as fm, \
+             open(candidate_out, "w", encoding="utf-8", newline="", buffering=1) as fc:
             rows = csv.DictReader(f1, delimiter="\t")
             mw, cw = csv.writer(fm, delimiter="\t", lineterminator="\n"), csv.writer(fc, delimiter="\t", lineterminator="\n")
             mw.writerow(["source1_entity_id", "matched_entity_ids"])
             cw.writerow(["source1_entity_id", "candidate_entity_ids"])
-            for row in rows:
+            for row_number, row in enumerate(rows, start=1):
                 eid = row["entity_id"]
                 name, _ = normalize_name(row.get("business_name", ""))
                 addr, _tokens, postal = normalize_address(row.get("business_address", ""))
@@ -66,18 +68,21 @@ def run(source1, source2, source3, matching_out, candidate_out, db_path=None):
                 # allow name-only only when it identifies one pool record.
                 candidates = set()
                 if name:
-                    candidates.update(x[0] for x in conn.execute(
-                        "SELECT eid FROM records WHERE country=? AND name=?", (country, name)))
+                    candidates.update(
+                        (x[0], x[1], x[2]) for x in conn.execute(
+                            "SELECT eid,addr,postal FROM records WHERE country=? AND name=?",
+                            (country, name)))
                 strong = set()
-                for cid in candidates:
-                    rec = conn.execute("SELECT addr,postal FROM records WHERE eid=?", (cid,)).fetchone()
-                    if rec and ((addr and rec[0] == addr) or (postal and rec[1] == postal)):
+                for cid, candidate_addr, candidate_postal in candidates:
+                    if (addr and candidate_addr == addr) or (postal and candidate_postal == postal):
                         strong.add(cid)
                 if not strong and len(candidates) == 1:
-                    strong = candidates
+                    strong = {next(iter(candidates))[0]}
                 ordered = sorted(strong)
                 mw.writerow([eid, ",".join(ordered)])
-                cw.writerow([eid, ",".join(sorted(candidates))])
+                cw.writerow([eid, ",".join(sorted(x[0] for x in candidates))])
+                if row_number % 10_000 == 0:
+                    print(f"[rule_based] processed {row_number:,} Source-1 rows", flush=True)
     finally:
         conn.close()
         if temporary:

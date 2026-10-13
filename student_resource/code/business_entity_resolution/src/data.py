@@ -25,8 +25,8 @@ class RecordStore:
             raise ValueError(f"Input file is missing columns: {missing}")
 
         self.ids = df["entity_id"].tolist()
-        self.name_norm, self.name_tokens, self.name_core = {}, {}, {}
-        self.addr_norm, self.addr_tokens, self.addr_core, self.postal = {}, {}, {}, {}
+        self.name_norm, self.name_tokens, self.name_core, self.name_core_str = {}, {}, {}, {}
+        self.addr_norm, self.addr_tokens, self.addr_core, self.postal, self.addr_digits = {}, {}, {}, {}, {}
         self.country = {}
         self.raw_name = dict(zip(df["entity_id"], df["business_name"]))
         self.raw_addr = dict(zip(df["entity_id"], df["business_address"]))
@@ -34,15 +34,17 @@ class RecordStore:
         for eid, name, addr, country in zip(
             df["entity_id"], df["business_name"], df["business_address"], df["country"]
         ):
-            n_norm, n_tok = norm.normalize_name(name)
-            a_norm, a_tok, postal = norm.normalize_address(addr)
+            n_norm, n_tok, n_core_str = norm.normalize_name(name)
+            a_norm, a_tok, postal, digits = norm.normalize_address(addr)
             self.name_norm[eid] = n_norm
             self.name_tokens[eid] = n_tok
+            self.name_core_str[eid] = n_core_str
             self.name_core[eid] = norm.core_tokens(n_tok, MIN_TOKEN_LEN)
             self.addr_norm[eid] = a_norm
             self.addr_tokens[eid] = a_tok
             self.addr_core[eid] = norm.core_tokens(a_tok, MIN_TOKEN_LEN)
             self.postal[eid] = postal
+            self.addr_digits[eid] = digits
             self.country[eid] = (str(country).strip().lower() if pd.notna(country) else "")
 
     def __len__(self):
