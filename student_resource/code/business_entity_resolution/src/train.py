@@ -6,20 +6,9 @@ Usage:
         --train-dir dataset/train \
         --model-out models/model.txt \
         --threshold-out models/threshold.json
-
-Steps:
-    1. Load + normalize train_source1/2/3.tsv and train_ground_truth.tsv.
-    2. Run blocking to get candidate_pairs for the training pool (also
-       reports blocking recall -- the ceiling on achievable recall).
-    3. Label each candidate pair: positive if in ground truth, else negative.
-    4. Split by Source-1 entity id (not by row) into train/val.
-    5. Train a LightGBM binary classifier with early stopping on val AUC.
-    6. Grid-search the decision threshold on val to maximize macro F0.5
-       (the actual leaderboard metric), evaluated over ALL val Source-1
-       entities (including ones blocking never produced candidates for).
-    7. Save the model and chosen threshold.
 """
 import argparse
+import gc
 import json
 import os
 import random
@@ -30,7 +19,7 @@ import pandas as pd
 
 from . import config
 from .blocking import generate_candidates
-from .data import load_source, load_ground_truth
+from .data import load_source, load_ground_truth, RecordStore
 from .features import build_feature_frame, MergedPool, FEATURE_COLUMNS
 from .metrics import macro_f_beta
 
@@ -61,52 +50,60 @@ def build_labeled_pairs(candidates, ground_truth, max_negatives_per_entity):
         pairs.extend(neg)
 
     recall = recall_hits / recall_total if recall_total else float("nan")
-    print(f"[train] Blocking recall on training pool: {recall_hits}/{recall_total} = {recall:.4f}")
+    print(f"[train] Blocking recall on training pool: {recall_hits}/{recall_total} = {recall:.4f}", flush=True)
     return pairs
 
 
-def run(train_dir, model_out, threshold_out, max_candidates, max_negatives, val_fraction):
-    print("[train] Loading sources...")
-    s1 = load_source(os.path.join(train_dir, "train_source1.tsv"))
+def run(train_dir, model_out, threshold_out, max_candidates, max_negatives, val_fraction, max_s1_entities=100_000):
+    print("[train] Loading sources...", flush=True)
+    s1_df = pd.read_csv(os.path.join(train_dir, "train_source1.tsv"), sep="\t", dtype=str, keep_default_na=False)
+    if max_s1_entities and len(s1_df) > max_s1_entities:
+        print(f"[train] Subsampling S1 to {max_s1_entities:,} entities for fast training...", flush=True)
+        s1_df = s1_df.sample(n=max_s1_entities, random_state=config.RANDOM_SEED).reset_index(drop=True)
+    s1 = RecordStore(s1_df)
     s2 = load_source(os.path.join(train_dir, "train_source2.tsv"))
     s3 = load_source(os.path.join(train_dir, "train_source3.tsv"))
     gt = load_ground_truth(os.path.join(train_dir, "train_ground_truth.tsv"))
-    print(f"[train] S1={len(s1)} S2={len(s2)} S3={len(s3)} ground-truth rows={len(gt)}")
+    print(f"[train] S1={len(s1)} S2={len(s2)} S3={len(s3)} ground-truth rows={len(gt)}", flush=True)
 
-    print("[train] Splitting Source-1 entities into train/val...")
+    print("[train] Splitting Source-1 entities into train/val...", flush=True)
     rng = random.Random(config.RANDOM_SEED)
     s1_ids = list(s1.ids)
     rng.shuffle(s1_ids)
     n_val = max(1, int(len(s1_ids) * val_fraction))
     val_ids = set(s1_ids[:n_val])
     train_ids = set(s1_ids[n_val:])
-    print(f"[train] train S1 entities={len(train_ids)} val S1 entities={len(val_ids)}")
+    print(f"[train] train S1 entities={len(train_ids)} val S1 entities={len(val_ids)}", flush=True)
 
-    print("[train] Running blocking on full training pool...")
+    print("[train] Running blocking on full training pool...", flush=True)
     candidates = generate_candidates(s1, [s2, s3], max_candidates=max_candidates)
 
     train_candidates = {k: v for k, v in candidates.items() if k in train_ids}
     val_candidates = {k: v for k, v in candidates.items() if k in val_ids}
 
-    print("[train] Building labeled pairs (train split)...")
+    print("[train] Building labeled pairs (train split)...", flush=True)
     train_pairs = build_labeled_pairs(train_candidates, gt, max_negatives)
-    print("[train] Building labeled pairs (val split, unsampled)...")
-    val_pairs = build_labeled_pairs(val_candidates, gt, None)  # keep all for honest eval
+    print("[train] Building labeled pairs (val split, unsampled)...", flush=True)
+    val_pairs = build_labeled_pairs(val_candidates, gt, None)
 
     pool = MergedPool([s2, s3])
 
-    def to_feature_df(pair_list):
-        triples = [(a, b, c) for a, b, c, _ in pair_list]
-        labels = [lbl for _, _, _, lbl in pair_list]
-        fdf = build_feature_frame(triples, s1, pool)
-        fdf["label"] = labels
-        return fdf
+    def to_feature_df(pair_list, batch_size=250_000):
+        dfs = []
+        for i in range(0, len(pair_list), batch_size):
+            chunk = pair_list[i:i+batch_size]
+            triples = [(a, b, c) for a, b, c, _ in chunk]
+            labels = [lbl for _, _, _, lbl in chunk]
+            fdf = build_feature_frame(triples, s1, pool)
+            fdf["label"] = labels
+            dfs.append(fdf)
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=FEATURE_COLUMNS + ["label", "source1_entity_id", "candidate_entity_id"])
 
-    print("[train] Computing features...")
+    print("[train] Computing features...", flush=True)
     train_df = to_feature_df(train_pairs)
     val_df = to_feature_df(val_pairs)
     print(f"[train] train pairs={len(train_df)} (pos={train_df['label'].sum()}) "
-          f"val pairs={len(val_df)} (pos={val_df['label'].sum()})")
+          f"val pairs={len(val_df)} (pos={val_df['label'].sum()})", flush=True)
 
     X_train, y_train = train_df[FEATURE_COLUMNS], train_df["label"]
     X_val, y_val = val_df[FEATURE_COLUMNS], val_df["label"]
@@ -119,7 +116,7 @@ def run(train_dir, model_out, threshold_out, max_candidates, max_negatives, val_
     train_set = lgb.Dataset(X_train, label=y_train, feature_name=FEATURE_COLUMNS)
     val_set = lgb.Dataset(X_val, label=y_val, feature_name=FEATURE_COLUMNS, reference=train_set)
 
-    print("[train] Training LightGBM...")
+    print("[train] Training LightGBM...", flush=True)
     booster = lgb.train(
         params,
         train_set,
@@ -131,7 +128,7 @@ def run(train_dir, model_out, threshold_out, max_candidates, max_negatives, val_
         ],
     )
 
-    print("[train] Scoring val candidates for threshold search...")
+    print("[train] Scoring val candidates for threshold search...", flush=True)
     val_df = val_df.copy()
     val_df["prob"] = booster.predict(X_val, num_iteration=booster.best_iteration)
 
@@ -145,7 +142,7 @@ def run(train_dir, model_out, threshold_out, max_candidates, max_negatives, val_
         if score > best_f:
             best_f, best_thresh = score, float(t)
 
-    print(f"[train] Best val macro F{config.F_BETA}: {best_f:.4f} at threshold={best_thresh:.2f}")
+    print(f"[train] Best val macro F{config.F_BETA}: {best_f:.4f} at threshold={best_thresh:.2f}", flush=True)
 
     os.makedirs(os.path.dirname(model_out) or ".", exist_ok=True)
     booster.save_model(model_out)
@@ -161,12 +158,12 @@ def run(train_dir, model_out, threshold_out, max_candidates, max_negatives, val_
             f,
             indent=2,
         )
-    print(f"[train] Saved model to {model_out} and threshold to {threshold_out}")
+    print(f"[train] Saved model to {model_out} and threshold to {threshold_out}", flush=True)
 
-    print("[train] Feature importance (gain):")
+    print("[train] Feature importance (gain):", flush=True)
     importances = booster.feature_importance(importance_type="gain")
     for name, imp in sorted(zip(FEATURE_COLUMNS, importances), key=lambda x: -x[1]):
-        print(f"    {name}: {imp:.1f}")
+        print(f"    {name}: {imp:.1f}", flush=True)
 
 
 def main():
@@ -177,10 +174,12 @@ def main():
     p.add_argument("--max-candidates", type=int, default=config.MAX_CANDIDATES_PER_ENTITY)
     p.add_argument("--max-negatives", type=int, default=config.MAX_NEGATIVES_PER_ENTITY)
     p.add_argument("--val-fraction", type=float, default=config.VAL_FRACTION)
+    p.add_argument("--max-s1-entities", type=int, default=100_000,
+                   help="Number of S1 entities to train on (default: 100,000 for fast high-accuracy training).")
     args = p.parse_args()
     run(args.train_dir, args.model_out, args.threshold_out, args.max_candidates,
-        args.max_negatives, args.val_fraction)
+        args.max_negatives, args.val_fraction, args.max_s1_entities)
 
 
 if __name__ == "__main__":
-    main()
+    main()

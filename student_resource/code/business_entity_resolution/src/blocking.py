@@ -71,16 +71,16 @@ def generate_candidates(s1_store, pool_stores, max_candidates=MAX_CANDIDATES_PER
     pool_stores: list of RecordStore (Source-2, Source-3) to draw candidates from.
 
     Returns: dict[s1_entity_id] -> list[(candidate_id, score)] sorted desc,
-    trimmed to max_candidates. score is the weighted-Jaccard blocking score.
+    trimmed to max_candidates. score is the blocking score.
     """
-    # Merge pool stores into flat lookup dicts keyed by entity_id.
     pool_ids = []
-    name_core, addr_core, country = {}, {}, {}
+    name_core, addr_core, country, postal = {}, {}, {}, {}
     for store in pool_stores:
         pool_ids.extend(store.ids)
         name_core.update(store.name_core)
         addr_core.update(store.addr_core)
         country.update(store.country)
+        postal.update(store.postal)
 
     name_index = _build_index(pool_ids, name_core, country, MAX_TOKEN_DOC_FREQ, MAX_TOKEN_POSTINGS)
     addr_index = _build_index(pool_ids, addr_core, country, MAX_TOKEN_DOC_FREQ, MAX_TOKEN_POSTINGS)
@@ -88,26 +88,72 @@ def generate_candidates(s1_store, pool_stores, max_candidates=MAX_CANDIDATES_PER
     candidates = {}
     for s1_id in s1_store.ids:
         c = s1_store.country[s1_id]
-        pool = set()
+        
+        # Token overlap count mapping for fast candidate pruning
+        cand_counts = defaultdict(int)
         for tok in s1_store.name_core[s1_id]:
-            pool.update(name_index.get((c, tok), []))
+            for cid in name_index.get((c, tok), ()):
+                cand_counts[cid] += 2  # name token match gets higher weight
         for tok in s1_store.addr_core[s1_id]:
-            pool.update(addr_index.get((c, tok), []))
+            for cid in addr_index.get((c, tok), ()):
+                cand_counts[cid] += 1
 
-        if not pool:
+        if not cand_counts:
             candidates[s1_id] = []
             continue
 
+        # Fast partition candidates by source (S2 and S3)
+        s2_pool = []
+        s3_pool = []
+        for cid, cnt in cand_counts.items():
+            if str(cid).startswith("S2-"):
+                s2_pool.append((cid, cnt))
+            else:
+                s3_pool.append((cid, cnt))
+        
+        # Keep top 10 from each source before jaccard
+        if len(s2_pool) > 10:
+            s2_pool.sort(key=lambda x: x[1], reverse=True)
+            s2_pool = s2_pool[:10]
+        if len(s3_pool) > 10:
+            s3_pool.sort(key=lambda x: x[1], reverse=True)
+            s3_pool = s3_pool[:10]
+
+        eval_pool = [cid for cid, _ in s2_pool] + [cid for cid, _ in s3_pool]
+
         s1_name_set = s1_store.name_core[s1_id]
         s1_addr_set = s1_store.addr_core[s1_id]
-        scored = []
-        for cid in pool:
-            name_sim = _jaccard(s1_name_set, name_core.get(cid, set()))
-            addr_sim = _jaccard(s1_addr_set, addr_core.get(cid, set()))
-            score = BLOCKING_NAME_WEIGHT * name_sim + BLOCKING_ADDRESS_WEIGHT * addr_sim
-            scored.append((cid, score))
+        s1_p = s1_store.postal[s1_id]
+        
+        s2_scored = []
+        s3_scored = []
+        for cid in eval_pool:
+            c_name_set = name_core.get(cid, set())
+            c_addr_set = addr_core.get(cid, set())
+            name_sim = _jaccard(s1_name_set, c_name_set)
+            addr_sim = _jaccard(s1_addr_set, c_addr_set)
+            
+            weighted = BLOCKING_NAME_WEIGHT * name_sim + BLOCKING_ADDRESS_WEIGHT * addr_sim
+            score = max(weighted, name_sim * 0.9, addr_sim * 0.85)
+            
+            # Postal match bonus
+            c_p = postal.get(cid)
+            if s1_p and c_p and s1_p == c_p:
+                score += 0.05
+            
+            if str(cid).startswith("S2-"):
+                s2_scored.append((cid, score))
+            else:
+                s3_scored.append((cid, score))
 
-        scored.sort(key=lambda x: x[1], reverse=True)
-        candidates[s1_id] = scored[:max_candidates]
+        top_cands = []
+        if s2_scored:
+            s2_scored.sort(key=lambda x: x[1], reverse=True)
+            top_cands.append(s2_scored[0])
+        if s3_scored:
+            s3_scored.sort(key=lambda x: x[1], reverse=True)
+            top_cands.append(s3_scored[0])
+
+        candidates[s1_id] = top_cands
 
     return candidates

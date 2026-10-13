@@ -20,8 +20,8 @@ MAX_CANDIDATES_PER_ENTITY = 50
 # Relative weight of name vs address token-overlap in the blocking rank score.
 BLOCKING_NAME_WEIGHT = 0.7
 BLOCKING_ADDRESS_WEIGHT = 0.3
-# Minimum token length to index (drop 1-2 char tokens, too noisy/common).
-MIN_TOKEN_LEN = 3
+# Minimum token length to index (allow 2+ char tokens to capture acronyms).
+MIN_TOKEN_LEN = 2
 
 # ---- Train/val split ----
 # Fraction of Source-1 training entities held out for validation (split by

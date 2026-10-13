@@ -10,16 +10,18 @@ Usage:
         --output-dir output
 """
 import argparse
+import gc
 import json
 import os
 
 import lightgbm as lgb
+import numpy as np
 import pandas as pd
 
 from . import config
 from .blocking import generate_candidates
 from .data import load_source
-from .features import build_feature_frame, MergedPool, FEATURE_COLUMNS
+from .features import compute_features_matrix, MergedPool, FEATURE_COLUMNS
 
 
 def write_id_list_tsv(path, header, mapping, all_s1_ids):
@@ -29,7 +31,6 @@ def write_id_list_tsv(path, header, mapping, all_s1_ids):
         f.write("\t".join(header) + "\n")
         for s1_id in all_s1_ids:
             ids = mapping.get(s1_id, [])
-            # dedupe while preserving order
             seen = set()
             ordered = []
             for i in ids:
@@ -39,42 +40,50 @@ def write_id_list_tsv(path, header, mapping, all_s1_ids):
             f.write(f"{s1_id}\t{','.join(ordered)}\n")
 
 
-def run(test_dir, model_path, threshold_file, output_dir, max_candidates_override=None):
-    print("[predict] Loading test sources...")
+def run(test_dir, model_path, threshold_file, output_dir, max_candidates_override=None, batch_size=200_000):
+    print("[predict] Loading test sources...", flush=True)
     s1 = load_source(os.path.join(test_dir, "test_source1.tsv"))
     s2 = load_source(os.path.join(test_dir, "test_source2.tsv"))
     s3 = load_source(os.path.join(test_dir, "test_source3.tsv"))
-    print(f"[predict] S1={len(s1)} S2={len(s2)} S3={len(s3)}")
+    print(f"[predict] S1={len(s1)} S2={len(s2)} S3={len(s3)}", flush=True)
 
     with open(threshold_file) as f:
         meta = json.load(f)
     threshold = meta["threshold"]
     max_candidates = max_candidates_override or meta.get("max_candidates", config.MAX_CANDIDATES_PER_ENTITY)
-    print(f"[predict] Using threshold={threshold} max_candidates={max_candidates}")
+    print(f"[predict] Using threshold={threshold} max_candidates={max_candidates}", flush=True)
 
-    print("[predict] Running blocking on test pool...")
+    print("[predict] Running blocking on test pool...", flush=True)
     candidates = generate_candidates(s1, [s2, s3], max_candidates=max_candidates)
 
     # candidate_pairs.tsv -- the exact set fed to the model.
     candidate_mapping = {s1_id: [c for c, _ in lst] for s1_id, lst in candidates.items()}
     n_with_candidates = sum(1 for v in candidate_mapping.values() if v)
-    print(f"[predict] {n_with_candidates}/{len(s1)} S1 entities have >=1 candidate.")
+    print(f"[predict] {n_with_candidates}/{len(s1)} S1 entities have >=1 candidate.", flush=True)
 
     pairs = [(s1_id, cand_id, score) for s1_id, lst in candidates.items() for cand_id, score in lst]
-    print(f"[predict] Scoring {len(pairs)} candidate pairs...")
+    print(f"[predict] Scoring {len(pairs)} candidate pairs...", flush=True)
     pool = MergedPool([s2, s3])
-    feat_df = build_feature_frame(pairs, s1, pool)
-
     booster = lgb.Booster(model_file=model_path)
-    if len(feat_df):
-        feat_df["prob"] = booster.predict(feat_df[FEATURE_COLUMNS])
-    else:
-        feat_df["prob"] = pd.Series(dtype=float)
 
-    matched = feat_df[feat_df["prob"] >= threshold]
     matching_mapping = {}
-    for s1_id, group in matched.groupby("source1_entity_id"):
-        matching_mapping[s1_id] = list(group["candidate_entity_id"])
+
+    # Score in batches to avoid high memory spikes
+    for start_idx in range(0, len(pairs), batch_size):
+        end_idx = min(start_idx + batch_size, len(pairs))
+        batch_pairs = pairs[start_idx:end_idx]
+        mat, b_s1_ids, b_cand_ids = compute_features_matrix(batch_pairs, s1, pool)
+        if len(mat):
+            probs = booster.predict(mat)
+            above_idx = np.where(probs >= threshold)[0]
+            for idx in above_idx:
+                s1_id = b_s1_ids[idx]
+                cid = b_cand_ids[idx]
+                if s1_id not in matching_mapping:
+                    matching_mapping[s1_id] = []
+                matching_mapping[s1_id].append(cid)
+        print(f"[predict] Processed {end_idx:,}/{len(pairs):,} pairs", flush=True)
+        gc.collect()
 
     matching_path = os.path.join(output_dir, "matching_results.tsv")
     candidate_path = os.path.join(output_dir, "candidate_pairs.tsv")
@@ -82,8 +91,8 @@ def run(test_dir, model_path, threshold_file, output_dir, max_candidates_overrid
     write_id_list_tsv(candidate_path, ["source1_entity_id", "candidate_entity_ids"], candidate_mapping, s1.ids)
 
     n_matched = sum(1 for v in matching_mapping.values() if v)
-    print(f"[predict] {n_matched}/{len(s1)} S1 entities predicted >=1 match.")
-    print(f"[predict] Wrote {matching_path} and {candidate_path}")
+    print(f"[predict] {n_matched}/{len(s1)} S1 entities predicted >=1 match.", flush=True)
+    print(f"[predict] Wrote {matching_path} and {candidate_path}", flush=True)
 
 
 def main():
@@ -99,4 +108,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()
