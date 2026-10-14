@@ -133,5 +133,3 @@ They then download or copy the competition dataset into `student_resource/datase
 ```bash
 git checkout -b improve-matching
 ```
-
-Never commit passwords, API keys, or private credentials. The competition prohibits external business-data lookups; all matching must use the supplied files.
